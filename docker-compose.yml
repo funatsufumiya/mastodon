@@ -2,7 +2,7 @@ version: '3'
 services:
   db:
     restart: always
-    image: postgres:14-alpine
+    image: hartmutcouk/pg-repack-docker:1.4.7
     shm_size: 256mb
     networks:
       - internal_network
