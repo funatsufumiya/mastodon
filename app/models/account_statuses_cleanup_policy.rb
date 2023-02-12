@@ -23,6 +23,14 @@ class AccountStatusesCleanupPolicy < ApplicationRecord
   include Redisable
 
   ALLOWED_MIN_STATUS_AGE = [
+    1.hours.seconds,
+    2.hours.seconds,
+    3.hours.seconds,
+    6.hours.seconds,
+    12.hours.seconds,
+    1.day.seconds,
+    2.days.seconds,
+    3.days.seconds,
     1.week.seconds,
     2.weeks.seconds,
     1.month.seconds,
