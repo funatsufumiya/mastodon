@@ -45,6 +45,102 @@ module Mastodon
       vacuum_and_analyze_conversations
     end
 
+    option :days, type: :numeric, default: 90
+    option :batch_size, type: :numeric, default: 1_000, aliases: [:b], desc: 'Number of records in each batch'
+    option :continue, type: :boolean, default: false, desc: 'If remove is not completed, execute from the previous continuation'
+    option :clean_followed, type: :boolean, default: false, desc: 'Include the status of remote accounts that are followed by local accounts as candidates for remove'
+    option :skip_status_remove, type: :boolean, default: false, desc: 'Skip status remove (run only cleanup tasks)'
+    option :skip_media_remove, type: :boolean, default: false, desc: 'Skip remove orphaned media attachments'
+    option :compress_database, type: :boolean, default: false, desc: 'Compress database and update the statistics. This option locks the table for a long time, so run it offline'
+    desc 'remove', 'Remove unreferenced statuses'
+    long_desc <<~LONG_DESC
+      Remove local statuses
+
+      It also removes orphaned records and performs additional cleanup tasks
+      such as updating statistics and recovering disk space.
+
+      This is a computationally heavy procedure that creates extra database
+      indices before commencing, and removes them afterward.
+    LONG_DESC
+    def remove_local
+      if options[:batch_size] < 1
+        say('Cannot run with this batch_size setting, must be at least 1', :red)
+        exit(1)
+      end
+
+      remove_statuses_local
+      vacuum_and_analyze_statuses
+      remove_orphans_media_attachments
+      remove_orphans_conversations
+      vacuum_and_analyze_conversations
+    end
+
+    private
+
+    def remove_statuses_local
+      return if options[:skip_status_remove]
+
+      say('Creating temporary database indices...')
+
+      ActiveRecord::Base.connection.add_index(:media_attachments, :remote_url, name: :index_media_attachments_remote_url, where: 'remote_url is not null', algorithm: :concurrently, if_not_exists: true)
+
+      max_id   = Mastodon::Snowflake.id_at(options[:days].days.ago, with_random: false)
+      start_at = Time.now.to_f
+
+      unless options[:continue] && ActiveRecord::Base.connection.table_exists?('statuses_to_be_deleted')
+        ActiveRecord::Base.connection.add_index(:accounts, :id, name: :index_accounts_local, where: 'domain is null', algorithm: :concurrently, if_not_exists: true)
+        ActiveRecord::Base.connection.add_index(:status_pins, :status_id, name: :index_status_pins_status_id, algorithm: :concurrently, if_not_exists: true)
+
+        say('Extract the deletion target from statuses... This might take a while...')
+
+        ActiveRecord::Base.connection.create_table('statuses_to_be_deleted', force: true)
+
+
+        ActiveRecord::Base.connection.exec_insert(<<-SQL.squish, 'SQL', [[nil, max_id]])
+          INSERT INTO statuses_to_be_deleted (id)
+          SELECT statuses.id FROM statuses WHERE deleted_at IS NULL AND local AND (id < $1)
+          AND NOT EXISTS (SELECT 1 FROM status_pins WHERE statuses.id = status_id)
+        SQL
+
+        say('Removing temporary database indices to restore write performance...')
+
+        ActiveRecord::Base.connection.remove_index(:accounts, name: :index_accounts_local, if_exists: true)
+        ActiveRecord::Base.connection.remove_index(:status_pins, name: :index_status_pins_status_id, if_exists: true)
+      end
+
+      say('Beginning statuses removal... This might take a while...')
+
+      klass = Class.new(ApplicationRecord) do |c|
+        c.table_name = 'statuses_to_be_deleted'
+      end
+
+      Object.const_set(:StatusToBeDeleted, klass)
+
+      scope     = StatusToBeDeleted
+      processed = 0
+      removed   = 0
+      progress  = create_progress_bar(scope.count.fdiv(options[:batch_size]).ceil)
+
+      scope.reorder(nil).in_batches(of: options[:batch_size]) do |relation|
+        ids        = relation.pluck(:id)
+        processed += ids.count
+        removed   += Status.unscoped.where(id: ids).delete_all
+        progress.increment
+      end
+
+      progress.stop
+
+      ActiveRecord::Base.connection.drop_table('statuses_to_be_deleted')
+
+      say("Done after #{Time.now.to_f - start_at}s, removed #{removed} out of #{processed} statuses.", :green)
+    ensure
+      say('Removing temporary database indices to restore write performance...')
+
+      ActiveRecord::Base.connection.remove_index(:accounts, name: :index_accounts_local, if_exists: true)
+      ActiveRecord::Base.connection.remove_index(:status_pins, name: :index_status_pins_status_id, if_exists: true)
+      ActiveRecord::Base.connection.remove_index(:media_attachments, name: :index_media_attachments_remote_url, if_exists: true)
+    end
+
     private
 
     def remove_statuses
@@ -127,7 +223,7 @@ module Mastodon
 
       say('Beginning removal of now-orphaned media attachments to free up disk space...')
 
-      scope     = MediaAttachment.reorder(nil).unattached.where('created_at < ?', options[:days].pred.days.ago)
+      scope     = MediaAttachment.reorder(nil).unattached.where('created_at < ?', (options[:days] - 1).days.ago)
       processed = 0
       removed   = 0
       progress  = create_progress_bar(scope.count)
